@@ -1,4 +1,8 @@
-import { connect as cfConnect } from "cloudflare:sockets";
+const cfConnect = (...args) => {
+  if (typeof connect === "function") return connect(...args);
+  if (typeof globalThis.connect === "function") return globalThis.connect(...args);
+  throw new Error("Cloudflare socket connect() is unavailable in this runtime");
+};
 
 // Debug mode flag
 const DEBUG_MODE = false; // Set to true only when debugging
@@ -3019,7 +3023,7 @@ function buildRuleProviders(ctx) {
   return geoAssets.reduce((providers, asset) => {
     addRuleProvider(providers, asset);
     return providers;
-  }, {}));
+  }, {});
 }
 function addRuleProvider(ruleProviders, ruleProvider) {
   const { geosite, geoip, geositeURL, geoipURL, format } = ruleProvider;
@@ -6798,9 +6802,21 @@ var worker_default = {
     }
   }
 };
-export {
-  worker_default as default
-};
+if (typeof addEventListener === "function") {
+  addEventListener("fetch", (event) => {
+    const env = {
+      UUID: globalThis.UUID,
+      TR_PASS: globalThis.TR_PASS,
+      FALLBACK: globalThis.FALLBACK,
+      DOH_URL: globalThis.DOH_URL,
+      SUB_PATH: globalThis.SUB_PATH,
+      PROXY_IP: globalThis.PROXY_IP,
+      PREFIX: globalThis.PREFIX,
+      kv: globalThis.kv
+    };
+    event.respondWith(worker_default.fetch(event.request, env, event));
+  });
+}
 /*! Bundled license information:
 
 jszip/dist/jszip.min.js:
