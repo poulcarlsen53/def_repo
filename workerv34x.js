@@ -19,6 +19,8 @@ const DNS_CACHE_TTL = 300000; // 5 minutes
 const DNS_CACHE_MAX_SIZE = 1000; // Maximum 1000 entries to prevent memory leak
 const NEGATIVE_DNS_CACHE_TTL = 60000; // 1 minute for failed DNS lookups
 const DNS_CACHE_CLEANUP_INTERVAL = 200;
+const DNS_URL_CACHE = new Map();
+const DNS_URL_CACHE_MAX_SIZE = 500;
 let dnsCacheCleanupCounter = 0;
 const ENDPOINT_HEALTH = new Map();
 const CIRCUIT_BREAKER_THRESHOLD = 3;
@@ -49,6 +51,10 @@ function normalizeClientIP(clientIP) {
 
 function getMaxRequestsPerMinute(env) {
   const raw = env?.MAX_REQUESTS_PER_MINUTE;
+  if (raw == null || raw === "") return DEFAULT_MAX_REQUESTS_PER_MINUTE;
+  const normalized = String(raw).trim();
+  if (!/^[-+]?\d+$/.test(normalized)) return DEFAULT_MAX_REQUESTS_PER_MINUTE;
+  const parsed = Number.parseInt(normalized, 10);
   const parsed = Number.parseInt(raw, 10);
   if (!Number.isFinite(parsed)) return DEFAULT_MAX_REQUESTS_PER_MINUTE;
   if (parsed <= 0) return 0;
@@ -78,6 +84,12 @@ function buildDoHForwardHeaders(request) {
   if (!headers.has("accept")) {
     headers.set("accept", "application/dns-message, application/dns-json");
   }
+  if (request.method === "POST") {
+    const contentType = (headers.get("content-type") || "").toLowerCase();
+    const isSupported = contentType.includes("application/dns-message") || contentType.includes("application/dns-json");
+    if (!isSupported) {
+      headers.set("content-type", "application/dns-message");
+    }
   if (request.method === "POST" && !headers.has("content-type")) {
     headers.set("content-type", "application/dns-message");
   }
@@ -371,6 +383,13 @@ async function generateKeyPair() {
     await crypto.subtle.exportKey("raw", keyPair.publicKey)
   );
   const base64Encode = (arr) => {
+    const len = arr.length;
+    const chunkSize = 32768;
+    const chunks = [];
+    for (let i = 0; i < len; i += chunkSize) {
+      chunks.push(String.fromCharCode(...arr.subarray(i, Math.min(i + chunkSize, len))));
+    }
+    return btoa(chunks.join(""));
     let binary = '';
     const len = arr.length;
     const chunkSize = 32768; // Safe chunk size for spread operator
@@ -398,6 +417,13 @@ function shouldTryEndpoint(address, port) {
   const key = endpointKey(address, port);
   const health = ENDPOINT_HEALTH.get(key);
   if (!health) return true;
+  const now = Date.now();
+  if (now - health.lastFail > ENDPOINT_HEALTH_TTL) {
+    ENDPOINT_HEALTH.delete(key);
+    return true;
+  }
+  if (!health.circuitOpen) return true;
+  if (now - health.lastFail > CIRCUIT_BREAKER_COOLDOWN) {
   if (!health.circuitOpen) return true;
   if (Date.now() - health.lastFail > CIRCUIT_BREAKER_COOLDOWN) {
     ENDPOINT_HEALTH.set(key, { failures: 0, lastFail: 0, circuitOpen: false });
@@ -495,26 +521,64 @@ function cleanupExpiredDNSCache(now = Date.now()) {
   }
 }
 
+function setDNSCacheEntry(cacheKey, value) {
+  if (DNS_CACHE.has(cacheKey)) {
+    DNS_CACHE.delete(cacheKey);
+  }
+  if (DNS_CACHE.size >= DNS_CACHE_MAX_SIZE) {
+    const oldestKey = DNS_CACHE.keys().next().value;
+    DNS_CACHE.delete(oldestKey);
+  }
+  DNS_CACHE.set(cacheKey, value);
+}
+
+function buildDNSURLs(domain, onlyIPv4 = false, dohURL = "https://cloudflare-dns.com/dns-query") {
+  const cacheKey = `${dohURL}|${domain}|${onlyIPv4 ? "4" : "46"}`;
+  const cached = DNS_URL_CACHE.get(cacheKey);
+  if (cached) {
+    DNS_URL_CACHE.delete(cacheKey);
+    DNS_URL_CACHE.set(cacheKey, cached);
+    return cached;
+  }
+  const encodedDomain = encodeURIComponent(domain);
+  const base = `${dohURL}?name=${encodedDomain}`;
+  const urls = {
+    ipv4: `${base}&type=A`,
+    ipv6: onlyIPv4 ? null : `${base}&type=AAAA`
+  };
+  if (DNS_URL_CACHE.size >= DNS_URL_CACHE_MAX_SIZE) {
+    const oldestKey = DNS_URL_CACHE.keys().next().value;
+    DNS_URL_CACHE.delete(oldestKey);
+  }
+  DNS_URL_CACHE.set(cacheKey, urls);
+  return urls;
+}
+
 async function resolveDNS(domain, onlyIPv4 = false, dohURL = "https://cloudflare-dns.com/dns-query") {
   dnsCacheCleanupCounter++;
   if (dnsCacheCleanupCounter >= DNS_CACHE_CLEANUP_INTERVAL) {
     dnsCacheCleanupCounter = 0;
     cleanupExpiredDNSCache();
   }
+  const cacheKey = `${dohURL}|${domain}|${onlyIPv4 ? "4" : "46"}`;
   const cacheKey = `${domain}_${onlyIPv4}`;
   const cached = DNS_CACHE.get(cacheKey);
   if (cached) {
     const ttl = cached.isFailure ? NEGATIVE_DNS_CACHE_TTL : DNS_CACHE_TTL;
     if (Date.now() - cached.timestamp < ttl) {
+      DNS_CACHE.delete(cacheKey);
+      DNS_CACHE.set(cacheKey, cached);
       if (cached.isFailure) {
         throw new Error(cached.error || `DNS lookup failed for ${domain}`);
       }
       return cached.data;
     }
+    DNS_CACHE.delete(cacheKey);
   }
   if (DNS_IN_FLIGHT.has(cacheKey)) {
     return DNS_IN_FLIGHT.get(cacheKey);
   }
+  const dohURLs = buildDNSURLs(domain, onlyIPv4, dohURL);
   const dohBaseURL = `${dohURL}?name=${encodeURIComponent(domain)}`;
   const dohURLs = {
     ipv4: `${dohBaseURL}&type=A`,
@@ -539,6 +603,7 @@ async function resolveDNS(domain, onlyIPv4 = false, dohURL = "https://cloudflare
       };
       const results = await Promise.allSettled([
         fetchWithTimeout(dohURLs.ipv4, 1, DNS_TIMEOUT),
+        onlyIPv4 || !dohURLs.ipv6 ? Promise.resolve([]) : fetchWithTimeout(dohURLs.ipv6, 28, DNS_TIMEOUT)
         onlyIPv4 ? Promise.resolve([]) : fetchWithTimeout(dohURLs.ipv6, 28, DNS_TIMEOUT)
       ]);
       const ipv4 = results[0].status === "fulfilled" ? results[0].value : [];
@@ -548,6 +613,14 @@ async function resolveDNS(domain, onlyIPv4 = false, dohURL = "https://cloudflare
         throw err;
       }
       const result = { ipv4, ipv6 };
+      setDNSCacheEntry(cacheKey, { data: result, timestamp: Date.now(), isFailure: false });
+      return result;
+    } catch (error) {
+      const message2 = error instanceof Error ? error.message : String(error);
+      const dnsErrorMessage = message2.length > 200 ? `${message2.slice(0, 200)}...` : message2;
+      if (cached && !cached.isFailure) return cached.data;
+      setDNSCacheEntry(cacheKey, { error: dnsErrorMessage, timestamp: Date.now(), isFailure: true });
+      throw new Error(`Error resolving DNS for ${domain}: ${dnsErrorMessage}`);
       if (DNS_CACHE.size >= DNS_CACHE_MAX_SIZE) {
         const firstKey = DNS_CACHE.keys().next().value;
         DNS_CACHE.delete(firstKey);
@@ -774,10 +847,74 @@ function isHttps(ctx, port) {
 }
 var isBypass = (type) => type === "direct";
 var isBlock = (type) => type === "block";
+function splitRulesByType(rules = []) {
+  const domains = [];
+  const ips = [];
+  for (const rule of rules) {
+    if (isDomain(rule)) domains.push(rule);
+    else ips.push(rule);
+  }
+  return { domains, ips };
+}
+function categorizeGeoAssets(geoAssets, localDNS, antiSanctionDNS) {
+  const categorized = {
+    routing: {
+      bypass: { geosites: [], geoips: [] },
+      block: { geosites: [], geoips: [] }
+    },
+    dns: {
+      bypass: {
+        localDNS: { geositeGeoips: [], geosites: [] },
+        antiSanctionDNS: { geosites: [] }
+      },
+      block: { geosites: [] }
+    }
+  };
+  for (const rule of geoAssets) {
+    const bypass = isBypass(rule.type);
+    const block = isBlock(rule.type);
+    if (bypass) {
+      categorized.routing.bypass.geosites.push(rule.geosite);
+      if (rule.geoip) categorized.routing.bypass.geoips.push(rule.geoip);
+      if (rule.dns === localDNS) {
+        if (rule.geoip) categorized.dns.bypass.localDNS.geositeGeoips.push({ geosite: rule.geosite, geoip: rule.geoip });
+        else categorized.dns.bypass.localDNS.geosites.push(rule.geosite);
+      }
+      if (rule.dns === antiSanctionDNS) {
+        categorized.dns.bypass.antiSanctionDNS.geosites.push(rule.geosite);
+      }
+    } else if (block) {
+      categorized.routing.block.geosites.push(rule.geosite);
+      if (rule.geoip) categorized.routing.block.geoips.push(rule.geoip);
+      categorized.dns.block.geosites.push(rule.geosite);
+    }
+  }
+  return categorized;
+}
 function accRoutingRules(ctx, geoAssets) {
   const {
     customBypassRules,
     customBypassSanctionRules,
+    customBlockRules,
+    localDNS,
+    antiSanctionDNS
+  } = ctx.settings;
+  const bypass = splitRulesByType(customBypassRules);
+  const bypassSanction = splitRulesByType(customBypassSanctionRules);
+  const blockRules = splitRulesByType(customBlockRules);
+  const categorized = categorizeGeoAssets(geoAssets, localDNS, antiSanctionDNS);
+  return {
+    bypass: {
+      geosites: categorized.routing.bypass.geosites,
+      geoips: categorized.routing.bypass.geoips,
+      domains: [...bypass.domains, ...bypassSanction.domains],
+      ips: bypass.ips
+    },
+    block: {
+      geosites: categorized.routing.block.geosites,
+      geoips: categorized.routing.block.geoips,
+      domains: blockRules.domains,
+      ips: blockRules.ips
     customBlockRules
   } = ctx.settings;
   return {
@@ -806,6 +943,25 @@ function accDnsRules(ctx, geoAssets) {
     customBypassSanctionRules,
     customBlockRules
   } = ctx.settings;
+  const bypass = splitRulesByType(customBypassRules);
+  const bypassSanction = splitRulesByType(customBypassSanctionRules);
+  const blockRules = splitRulesByType(customBlockRules);
+  const categorized = categorizeGeoAssets(geoAssets, localDNS, antiSanctionDNS);
+  return {
+    bypass: {
+      localDNS: {
+        geositeGeoips: categorized.dns.bypass.localDNS.geositeGeoips,
+        geosites: categorized.dns.bypass.localDNS.geosites,
+        domains: bypass.domains
+      },
+      antiSanctionDNS: {
+        geosites: categorized.dns.bypass.antiSanctionDNS.geosites,
+        domains: bypassSanction.domains
+      }
+    },
+    block: {
+      geosites: categorized.dns.block.geosites,
+      domains: blockRules.domains
   return {
     bypass: {
       localDNS: {
@@ -5226,6 +5382,8 @@ async function handleTCPOutBound(ctx, remoteSocketWapper, addressRemote, portRem
       const CONNECTION_TIMEOUT = 10000;
       
       tcpSocket = cfConnect({
+        hostname: targetAddress,
+        port: targetPort
         hostname: currentAddress,
         port: currentPort
       });
@@ -5244,6 +5402,8 @@ async function handleTCPOutBound(ctx, remoteSocketWapper, addressRemote, portRem
 
     } catch (error) {
       recordEndpointFailure(targetAddress, targetPort);
+      const message2 = error instanceof Error ? error.message : String(error);
+      log(`Connection attempt ${i + 1} failed: ${message2}`);
       log(`Connection attempt ${i + 1} failed: ${error.message}`);
       if (tcpSocket) safeCloseTcpSocket(tcpSocket);
       remoteSocketWapper.value = null;
@@ -5287,6 +5447,8 @@ async function handleTCPOutBound(ctx, remoteSocketWapper, addressRemote, portRem
     } catch (error) {
       remoteSocketWapper.connecting = false;
       recordEndpointFailure(targetAddress, targetPort);
+      const message2 = error instanceof Error ? error.message : String(error);
+      log(`Data transmission phase failed: ${message2}`);
       log(`Data transmission phase failed: ${error.message}`);
       // Critical: Once we send rawClientData, we NEVER retry from the beginning 
       // because the server may have already received and acted on the request.
