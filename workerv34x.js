@@ -541,7 +541,7 @@ async function resolveDNS(domain, onlyIPv4 = false, dohURL = "https://cloudflare
     dnsCacheCleanupCounter = 0;
     cleanupExpiredDNSCache();
   }
-  const cacheKey = `${domain}_${onlyIPv4}`;
+  const cacheKey = `${dohURL}|${domain}|${onlyIPv4 ? "4" : "46"}`;
   const cached = DNS_CACHE.get(cacheKey);
   if (cached) {
     const ttl = cached.isFailure ? NEGATIVE_DNS_CACHE_TTL : DNS_CACHE_TTL;
