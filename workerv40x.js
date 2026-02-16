@@ -5775,6 +5775,7 @@ async function VlOverWSHandler(ctx) {
     safeCloseTcpSocket(remoteSocketWapper.value);
     safeCloseWebSocket(webSocket);
     releaseConnection();
+  }, 1800000);
   });
   const overallTimeoutId = createOverallConnectionTimeout(log, () => {
     watchdog.stop();
@@ -5795,6 +5796,7 @@ async function VlOverWSHandler(ctx) {
         const chunkSize = chunk?.byteLength ?? chunk?.length ?? 0;
         while (queuedOutboundBytes + chunkSize > MAX_OUTBOUND_WRITE_QUEUE_BYTES) {
           await new Promise((resolve) => setTimeout(resolve, BACKPRESSURE_WAIT_MS));
+          watchdog.touch();
         }
         queuedOutboundBytes += chunkSize;
         try {
@@ -6133,6 +6135,7 @@ async function TrOverWSHandler(ctx) {
     safeCloseTcpSocket(remoteSocketWapper.value);
     safeCloseWebSocket(webSocket);
     releaseConnection();
+  }, 1800000);
   });
   const overallTimeoutId = createOverallConnectionTimeout(log, () => {
     watchdog.stop();
@@ -6152,6 +6155,7 @@ async function TrOverWSHandler(ctx) {
         const chunkSize = chunk?.byteLength ?? chunk?.length ?? 0;
         while (queuedOutboundBytes + chunkSize > MAX_OUTBOUND_WRITE_QUEUE_BYTES) {
           await new Promise((resolve) => setTimeout(resolve, BACKPRESSURE_WAIT_MS));
+          watchdog.touch();
         }
         queuedOutboundBytes += chunkSize;
         try {
