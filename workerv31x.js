@@ -1,4 +1,3 @@
-const cfConnect = typeof connect === "function" ? connect : (typeof globalThis !== "undefined" && typeof globalThis.connect === "function" ? globalThis.connect : null);
 import { connect as cfConnect } from "cloudflare:sockets";
 
 // Debug mode flag
@@ -20,8 +19,6 @@ const DNS_CACHE_TTL = 300000; // 5 minutes
 const DNS_CACHE_MAX_SIZE = 1000; // Maximum 1000 entries to prevent memory leak
 const NEGATIVE_DNS_CACHE_TTL = 60000; // 1 minute for failed DNS lookups
 const DNS_CACHE_CLEANUP_INTERVAL = 200;
-const DNS_URL_CACHE = new Map();
-const DNS_URL_CACHE_MAX_SIZE = 500;
 let dnsCacheCleanupCounter = 0;
 const ENDPOINT_HEALTH = new Map();
 const CIRCUIT_BREAKER_THRESHOLD = 3;
@@ -38,19 +35,10 @@ let ENDPOINT_PRUNE_COUNTER = 0;
 // RATE / CONNECTION LIMITING
 // ============================================
 const RATE_LIMIT = new Map();
-const DEFAULT_MAX_REQUESTS_PER_MINUTE = 600;
+const MAX_REQUESTS_PER_MINUTE = 600;
 const RATE_LIMIT_CLEANUP_INTERVAL = 100;
 const ACTIVE_CONNECTIONS = new Map();
 const MAX_CONNECTIONS_PER_IP = 20;
-const MAX_GLOBAL_CONNECTIONS = 2000;
-let GLOBAL_CONNECTION_COUNT = 0;
-const MAX_OUTBOUND_WRITE_QUEUE_BYTES = 16 * 1024 * 1024;
-const BACKPRESSURE_WAIT_MS = 50;
-const REGEX_NUMERIC_INT = /^[-+]?\d+$/;
-const REGEX_HOST_PORT = /^(?:\[(?<ipv6>.+?)\]|(?<host>[^:]+))(:(?<port>\d+))?$/;
-const REGEX_UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-[4][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const MIN_FRAGMENT_LENGTH = 10;
-const MAX_FRAGMENT_LENGTH = 2048;
 let rateLimitCleanupCounter = 0;
 
 function normalizeClientIP(clientIP) {
@@ -59,64 +47,16 @@ function normalizeClientIP(clientIP) {
   return first || "unknown";
 }
 
-function getMaxRequestsPerMinute(env) {
-  const raw = env?.MAX_REQUESTS_PER_MINUTE;
-  if (raw == null || raw === "") return DEFAULT_MAX_REQUESTS_PER_MINUTE;
-  const normalized = String(raw).trim();
-  if (!REGEX_NUMERIC_INT.test(normalized)) return DEFAULT_MAX_REQUESTS_PER_MINUTE;
-  const parsed = Number.parseInt(normalized, 10);
-  if (!Number.isFinite(parsed)) return DEFAULT_MAX_REQUESTS_PER_MINUTE;
-  if (parsed <= 0) return 0;
-  return Math.min(parsed, 1e4);
-}
-
-function getActiveConnectionStats() {
-  let totalConnections = 0;
-  for (const count of ACTIVE_CONNECTIONS.values()) {
-    totalConnections += count;
-  }
-  return {
-    totalConnections,
-    trackedIPs: ACTIVE_CONNECTIONS.size,
-    maxConnectionsPerIP: MAX_CONNECTIONS_PER_IP,
-    globalConnections: GLOBAL_CONNECTION_COUNT,
-    maxGlobalConnections: MAX_GLOBAL_CONNECTIONS
-  };
-}
-
-function buildDoHForwardHeaders(request) {
-  const incoming = request.headers;
-  const headers = new Headers();
-  const acceptedRequestHeaders = ["accept", "content-type"];
-  for (const key of acceptedRequestHeaders) {
-    const value = incoming.get(key);
-    if (value) headers.set(key, value);
-  }
-  if (!headers.has("accept")) {
-    headers.set("accept", "application/dns-message, application/dns-json");
-  }
-  if (request.method === "POST") {
-    const contentType = (headers.get("content-type") || "").toLowerCase();
-    const isSupported = contentType.includes("application/dns-message") || contentType.includes("application/dns-json");
-    if (!isSupported) {
-      headers.set("content-type", "application/dns-message");
-    }
-  }
-  return headers;
-}
-
-function checkRateLimit(clientIP, maxRequestsPerMinute = DEFAULT_MAX_REQUESTS_PER_MINUTE) {
-  if (!Number.isFinite(maxRequestsPerMinute) || maxRequestsPerMinute <= 0) return true;
+function checkRateLimit(clientIP) {
   const ipKey = normalizeClientIP(clientIP);
   if (!ipKey || ipKey === "unknown") return true;
   const now = Date.now();
   const currentMinute = Math.floor(now / 60000);
   const key = `${ipKey}_${currentMinute}`;
-  RATE_LIMIT.delete(`${ipKey}_${currentMinute - 3}`);
   const count = RATE_LIMIT.get(key) || 0;
-  if (count >= maxRequestsPerMinute) {
+  if (count >= MAX_REQUESTS_PER_MINUTE) {
     if (DEBUG_MODE) {
-      console.log(`[RATE LIMIT] IP ${ipKey} exceeded ${maxRequestsPerMinute} req/min`);
+      console.log(`[RATE LIMIT] IP ${ipKey} exceeded ${MAX_REQUESTS_PER_MINUTE} req/min`);
     }
     return false;
   }
@@ -143,39 +83,17 @@ function cleanupRateLimitCache(currentMinute) {
   }
 }
 
-function sanitizeRangeString(value, fallback, minAllowed, maxAllowed) {
-  if (!value || typeof value !== "string") return fallback;
-  const normalized = value.trim();
-  if (!normalized) return fallback;
-  const parts = normalized.split("-").map((part) => Number.parseInt(part, 10));
-  if (parts.some((part) => !Number.isFinite(part))) return fallback;
-  if (parts.length === 1) {
-    const clamped = Math.max(minAllowed, Math.min(maxAllowed, parts[0]));
-    return String(clamped);
-  }
-  let [minValue, maxValue] = parts;
-  minValue = Math.max(minAllowed, Math.min(maxAllowed, minValue));
-  maxValue = Math.max(minAllowed, Math.min(maxAllowed, maxValue));
-  if (minValue > maxValue) [minValue, maxValue] = [maxValue, minValue];
-  return minValue === maxValue ? String(minValue) : `${minValue}-${maxValue}`;
+function checkConnectionLimit(clientIP) {
+  const ipKey = normalizeClientIP(clientIP);
+  if (!ipKey || ipKey === "unknown") return true;
+  return (ACTIVE_CONNECTIONS.get(ipKey) || 0) < MAX_CONNECTIONS_PER_IP;
 }
 
-function acquireConnectionSlot(clientIP) {
-  if (GLOBAL_CONNECTION_COUNT >= MAX_GLOBAL_CONNECTIONS) return null;
+function beginConnectionTracking(clientIP) {
   const ipKey = normalizeClientIP(clientIP);
-  if (!ipKey || ipKey === "unknown") {
-    GLOBAL_CONNECTION_COUNT++;
-    let released = false;
-    return () => {
-      if (released) return;
-      released = true;
-      GLOBAL_CONNECTION_COUNT = Math.max(0, GLOBAL_CONNECTION_COUNT - 1);
-    };
-  }
+  if (!ipKey || ipKey === "unknown") return () => {};
   const current = ACTIVE_CONNECTIONS.get(ipKey) || 0;
-  if (current >= MAX_CONNECTIONS_PER_IP) return null;
   ACTIVE_CONNECTIONS.set(ipKey, current + 1);
-  GLOBAL_CONNECTION_COUNT++;
   let released = false;
   return () => {
     if (released) return;
@@ -183,7 +101,6 @@ function acquireConnectionSlot(clientIP) {
     const count = ACTIVE_CONNECTIONS.get(ipKey) || 0;
     if (count <= 1) ACTIVE_CONNECTIONS.delete(ipKey);
     else ACTIVE_CONNECTIONS.set(ipKey, count - 1);
-    GLOBAL_CONNECTION_COUNT = Math.max(0, GLOBAL_CONNECTION_COUNT - 1);
   };
 }
 
@@ -421,13 +338,13 @@ async function generateKeyPair() {
     await crypto.subtle.exportKey("raw", keyPair.publicKey)
   );
   const base64Encode = (arr) => {
+    let binary = '';
     const len = arr.length;
-    const chunkSize = 32768;
-    const chunks = [];
+    const chunkSize = 32768; // Safe chunk size for spread operator
     for (let i = 0; i < len; i += chunkSize) {
-      chunks.push(String.fromCharCode(...arr.subarray(i, Math.min(i + chunkSize, len))));
+      binary += String.fromCharCode(...arr.subarray(i, Math.min(i + chunkSize, len)));
     }
-    return btoa(chunks.join(""));
+    return btoa(binary);
   };
   return {
     publicKey: base64Encode(publicKeyRaw),
@@ -438,7 +355,7 @@ async function generateKeyPair() {
 // src/cores/utils.ts
 function isDomain(address) {
   if (!address) return false;
-  const domainRegex = /^(?=.{1,253}$)(?!-)(?:[A-Za-z0-9-]{1,63}\.)+[A-Za-z]{2,63}$/;
+  const domainRegex = /^(?!-)(?:[A-Za-z0-9-]{1,63}.)+[A-Za-z]{2,}$/;
   return domainRegex.test(address);
 }
 function endpointKey(address, port) {
@@ -448,13 +365,8 @@ function shouldTryEndpoint(address, port) {
   const key = endpointKey(address, port);
   const health = ENDPOINT_HEALTH.get(key);
   if (!health) return true;
-  const now = Date.now();
-  if (now - health.lastFail > ENDPOINT_HEALTH_TTL) {
-    ENDPOINT_HEALTH.delete(key);
-    return true;
-  }
   if (!health.circuitOpen) return true;
-  if (now - health.lastFail > CIRCUIT_BREAKER_COOLDOWN) {
+  if (Date.now() - health.lastFail > CIRCUIT_BREAKER_COOLDOWN) {
     ENDPOINT_HEALTH.set(key, { failures: 0, lastFail: 0, circuitOpen: false });
     return true;
   }
@@ -550,63 +462,31 @@ function cleanupExpiredDNSCache(now = Date.now()) {
   }
 }
 
-function setDNSCacheEntry(cacheKey, value) {
-  if (DNS_CACHE.has(cacheKey)) {
-    DNS_CACHE.delete(cacheKey);
-  }
-  if (DNS_CACHE.size >= DNS_CACHE_MAX_SIZE) {
-    const oldestKey = DNS_CACHE.keys().next().value;
-    DNS_CACHE.delete(oldestKey);
-  }
-  DNS_CACHE.set(cacheKey, value);
-}
-
-function buildDNSURLs(domain, onlyIPv4 = false, dohURL = "https://cloudflare-dns.com/dns-query") {
-  const cacheKey = `${dohURL}|${domain}|${onlyIPv4 ? "4" : "46"}`;
-  const cached = DNS_URL_CACHE.get(cacheKey);
-  if (cached) {
-    DNS_URL_CACHE.delete(cacheKey);
-    DNS_URL_CACHE.set(cacheKey, cached);
-    return cached;
-  }
-  const encodedDomain = encodeURIComponent(domain);
-  const base = `${dohURL}?name=${encodedDomain}`;
-  const urls = {
-    ipv4: `${base}&type=A`,
-    ipv6: onlyIPv4 ? null : `${base}&type=AAAA`
-  };
-  if (DNS_URL_CACHE.size >= DNS_URL_CACHE_MAX_SIZE) {
-    const oldestKey = DNS_URL_CACHE.keys().next().value;
-    DNS_URL_CACHE.delete(oldestKey);
-  }
-  DNS_URL_CACHE.set(cacheKey, urls);
-  return urls;
-}
-
 async function resolveDNS(domain, onlyIPv4 = false, dohURL = "https://cloudflare-dns.com/dns-query") {
   dnsCacheCleanupCounter++;
   if (dnsCacheCleanupCounter >= DNS_CACHE_CLEANUP_INTERVAL) {
     dnsCacheCleanupCounter = 0;
     cleanupExpiredDNSCache();
   }
-  const cacheKey = `${dohURL}|${domain}|${onlyIPv4 ? "4" : "46"}`;
+  const cacheKey = `${domain}_${onlyIPv4}`;
   const cached = DNS_CACHE.get(cacheKey);
   if (cached) {
     const ttl = cached.isFailure ? NEGATIVE_DNS_CACHE_TTL : DNS_CACHE_TTL;
     if (Date.now() - cached.timestamp < ttl) {
-      DNS_CACHE.delete(cacheKey);
-      DNS_CACHE.set(cacheKey, cached);
       if (cached.isFailure) {
         throw new Error(cached.error || `DNS lookup failed for ${domain}`);
       }
       return cached.data;
     }
-    DNS_CACHE.delete(cacheKey);
   }
   if (DNS_IN_FLIGHT.has(cacheKey)) {
     return DNS_IN_FLIGHT.get(cacheKey);
   }
-  const dohURLs = buildDNSURLs(domain, onlyIPv4, dohURL);
+  const dohBaseURL = `${dohURL}?name=${encodeURIComponent(domain)}`;
+  const dohURLs = {
+    ipv4: `${dohBaseURL}&type=A`,
+    ipv6: `${dohBaseURL}&type=AAAA`
+  };
   const fetchPromise = (async () => {
     try {
       const DNS_TIMEOUT = 3000;
@@ -626,7 +506,7 @@ async function resolveDNS(domain, onlyIPv4 = false, dohURL = "https://cloudflare
       };
       const results = await Promise.allSettled([
         fetchWithTimeout(dohURLs.ipv4, 1, DNS_TIMEOUT),
-        onlyIPv4 || !dohURLs.ipv6 ? Promise.resolve([]) : fetchWithTimeout(dohURLs.ipv6, 28, DNS_TIMEOUT)
+        onlyIPv4 ? Promise.resolve([]) : fetchWithTimeout(dohURLs.ipv6, 28, DNS_TIMEOUT)
       ]);
       const ipv4 = results[0].status === "fulfilled" ? results[0].value : [];
       const ipv6 = results[1].status === "fulfilled" ? results[1].value : [];
@@ -635,14 +515,21 @@ async function resolveDNS(domain, onlyIPv4 = false, dohURL = "https://cloudflare
         throw err;
       }
       const result = { ipv4, ipv6 };
-      setDNSCacheEntry(cacheKey, { data: result, timestamp: Date.now(), isFailure: false });
+      if (DNS_CACHE.size >= DNS_CACHE_MAX_SIZE) {
+        const firstKey = DNS_CACHE.keys().next().value;
+        DNS_CACHE.delete(firstKey);
+      }
+      DNS_CACHE.set(cacheKey, { data: result, timestamp: Date.now(), isFailure: false });
       return result;
     } catch (error) {
       const message2 = error instanceof Error ? error.message : String(error);
-      const dnsErrorMessage = message2.length > 200 ? `${message2.slice(0, 200)}...` : message2;
       if (cached && !cached.isFailure) return cached.data;
-      setDNSCacheEntry(cacheKey, { error: dnsErrorMessage, timestamp: Date.now(), isFailure: true });
-      throw new Error(`Error resolving DNS for ${domain}: ${dnsErrorMessage}`);
+      if (DNS_CACHE.size >= DNS_CACHE_MAX_SIZE) {
+        const firstKey = DNS_CACHE.keys().next().value;
+        DNS_CACHE.delete(firstKey);
+      }
+      DNS_CACHE.set(cacheKey, { error: message2, timestamp: Date.now(), isFailure: true });
+      throw new Error(`Error resolving DNS for ${domain}: ${message2}`);
     } finally {
       DNS_IN_FLIGHT.delete(cacheKey);
     }
@@ -839,7 +726,8 @@ function selectSniHost(ctx, address) {
   return { host, sni, allowInsecure: isCustomAddr };
 }
 function parseHostPort(input, brackets) {
-  const match = input.match(REGEX_HOST_PORT);
+  const regex = /^(?:\[(?<ipv6>.+?)\]|(?<host>[^:]+))(:(?<port>\d+))?$/;
+  const match = input.match(regex);
   if (!match || !match.groups) return { host: "", port: 0 };
   const { ipv6, host: plainHost, port: portStr } = match.groups;
   let host = ipv6 ?? plainHost ?? "";
@@ -853,74 +741,27 @@ function isHttps(ctx, port) {
 }
 var isBypass = (type) => type === "direct";
 var isBlock = (type) => type === "block";
-function splitRulesByType(rules = []) {
-  const domains = [];
-  const ips = [];
-  for (const rule of rules) {
-    if (isDomain(rule)) domains.push(rule);
-    else ips.push(rule);
-  }
-  return { domains, ips };
-}
-function categorizeGeoAssets(geoAssets, localDNS, antiSanctionDNS) {
-  const categorized = {
-    routing: {
-      bypass: { geosites: [], geoips: [] },
-      block: { geosites: [], geoips: [] }
-    },
-    dns: {
-      bypass: {
-        localDNS: { geositeGeoips: [], geosites: [] },
-        antiSanctionDNS: { geosites: [] }
-      },
-      block: { geosites: [] }
-    }
-  };
-  for (const rule of geoAssets) {
-    const bypass = isBypass(rule.type);
-    const block = isBlock(rule.type);
-    if (bypass) {
-      categorized.routing.bypass.geosites.push(rule.geosite);
-      if (rule.geoip) categorized.routing.bypass.geoips.push(rule.geoip);
-      if (rule.dns === localDNS) {
-        if (rule.geoip) categorized.dns.bypass.localDNS.geositeGeoips.push({ geosite: rule.geosite, geoip: rule.geoip });
-        else categorized.dns.bypass.localDNS.geosites.push(rule.geosite);
-      }
-      if (rule.dns === antiSanctionDNS) {
-        categorized.dns.bypass.antiSanctionDNS.geosites.push(rule.geosite);
-      }
-    } else if (block) {
-      categorized.routing.block.geosites.push(rule.geosite);
-      if (rule.geoip) categorized.routing.block.geoips.push(rule.geoip);
-      categorized.dns.block.geosites.push(rule.geosite);
-    }
-  }
-  return categorized;
-}
 function accRoutingRules(ctx, geoAssets) {
   const {
     customBypassRules,
     customBypassSanctionRules,
-    customBlockRules,
-    localDNS,
-    antiSanctionDNS
+    customBlockRules
   } = ctx.settings;
-  const bypass = splitRulesByType(customBypassRules);
-  const bypassSanction = splitRulesByType(customBypassSanctionRules);
-  const blockRules = splitRulesByType(customBlockRules);
-  const categorized = categorizeGeoAssets(geoAssets, localDNS, antiSanctionDNS);
   return {
     bypass: {
-      geosites: categorized.routing.bypass.geosites,
-      geoips: categorized.routing.bypass.geoips,
-      domains: [...bypass.domains, ...bypassSanction.domains],
-      ips: bypass.ips
+      geosites: geoAssets.filter((rule) => isBypass(rule.type)).map((rule) => rule.geosite),
+      geoips: geoAssets.filter((rule) => isBypass(rule.type) && rule.geoip).map((rule) => rule.geoip),
+      domains: [
+        ...customBypassRules.filter(isDomain),
+        ...customBypassSanctionRules.filter(isDomain)
+      ],
+      ips: customBypassRules.filter((rule) => !isDomain(rule))
     },
     block: {
-      geosites: categorized.routing.block.geosites,
-      geoips: categorized.routing.block.geoips,
-      domains: blockRules.domains,
-      ips: blockRules.ips
+      geosites: geoAssets.filter((rule) => isBlock(rule.type)).map((rule) => rule.geosite),
+      geoips: geoAssets.filter((rule) => isBlock(rule.type) && rule.geoip).map((rule) => rule.geoip),
+      domains: customBlockRules.filter(isDomain),
+      ips: customBlockRules.filter((rule) => !isDomain(rule))
     }
   };
 }
@@ -932,25 +773,21 @@ function accDnsRules(ctx, geoAssets) {
     customBypassSanctionRules,
     customBlockRules
   } = ctx.settings;
-  const bypass = splitRulesByType(customBypassRules);
-  const bypassSanction = splitRulesByType(customBypassSanctionRules);
-  const blockRules = splitRulesByType(customBlockRules);
-  const categorized = categorizeGeoAssets(geoAssets, localDNS, antiSanctionDNS);
   return {
     bypass: {
       localDNS: {
-        geositeGeoips: categorized.dns.bypass.localDNS.geositeGeoips,
-        geosites: categorized.dns.bypass.localDNS.geosites,
-        domains: bypass.domains
+        geositeGeoips: geoAssets.filter(({ type, geoip, dns }) => isBypass(type) && geoip && dns === localDNS).map(({ geosite, geoip }) => ({ geosite, geoip })),
+        geosites: geoAssets.filter(({ type, geoip, dns }) => isBypass(type) && !geoip && dns === localDNS).map((rule) => rule.geosite),
+        domains: customBypassRules.filter(isDomain)
       },
       antiSanctionDNS: {
-        geosites: categorized.dns.bypass.antiSanctionDNS.geosites,
-        domains: bypassSanction.domains
+        geosites: geoAssets.filter((rule) => isBypass(rule.type) && rule.dns === antiSanctionDNS).map((rule) => rule.geosite),
+        domains: customBypassSanctionRules.filter(isDomain)
       }
     },
     block: {
-      geosites: categorized.dns.block.geosites,
-      domains: blockRules.domains
+      geosites: geoAssets.filter((rule) => isBlock(rule.type)).map((rule) => rule.geosite),
+      domains: customBlockRules.filter(isDomain)
     }
   };
 }
@@ -969,30 +806,15 @@ function omitEmpty(obj) {
   return obj;
 }
 
-function safeCloneProxy(proxyObj) {
-  if (proxyObj === null || typeof proxyObj !== "object") return proxyObj;
-  if (Array.isArray(proxyObj)) return proxyObj.map(safeCloneProxy);
-  const cloned = {};
-  for (const key of Object.keys(proxyObj)) {
-    cloned[key] = safeCloneProxy(proxyObj[key]);
-  }
-  return cloned;
-}
-
 // src/common/common.ts
-function base64ToUint8Array(base64) {
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes;
-}
 function base64DecodeUtf8(base64) {
-  return new TextDecoder().decode(base64ToUint8Array(base64));
+  return new TextDecoder().decode(
+    Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
+  );
 }
 function isValidUUID(uuid) {
-  return REGEX_UUID_V4.test(uuid);
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[4][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  return uuidRegex.test(uuid);
 }
 function respond(success, status, message2, body, customHeaders) {
   const headers = {
@@ -1312,27 +1134,19 @@ function extractProxyParams(chainProxy) {
 async function extractEchConfig(enableECH, hostName) {
   if (!enableECH) return "";
   // const { httpConfig: { hostName } } = globalThis; // Removed
-  try {
-    const url = new URL("https://dns.google/resolve");
-    url.searchParams.set("name", hostName);
-    url.searchParams.set("type", "HTTPS");
-    const res = await fetch(url.toString(), {
-      headers: { accept: "application/dns-json" }
-    });
-    if (!res.ok) return "";
-    const dns = await res.json();
-    if (!dns.Answer || !Array.isArray(dns.Answer)) return "";
-    for (const ans of dns.Answer) {
-      const ech = ans.data.match(/ech=([^ ]+)/)?.[1];
-      if (ech) return ech;
-    }
-  } catch (error) {
-    if (DEBUG_MODE) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.log(`[ECH] Failed to fetch ECH config: ${message}`);
-    }
+  const url = new URL("https://dns.google/resolve");
+  url.searchParams.set("name", hostName);
+  url.searchParams.set("type", "HTTPS");
+  const res = await fetch(url.toString(), {
+    headers: { accept: "application/dns-json" }
+  });
+  const dns = await res.json();
+  if (!dns.Answer || !Array.isArray(dns.Answer)) return "";
+  for (const ans of dns.Answer) {
+    const ech = ans.data.match(/ech=([^ ]+)/)?.[1];
+    if (ech) return ech;
   }
-  return "";
+  throw new Error("ECH record not found");
 }
 
 // src/common/init.ts
@@ -3079,9 +2893,6 @@ async function Authenticate(request, env) {
   }
 }
 async function resetPassword(request, env) {
-  if (request.method !== "POST") {
-    return respond(false, 405 /* METHOD_NOT_ALLOWED */, "Method not allowed.");
-  }
   let auth = await Authenticate(request, env);
   const oldPwd = await env.kv.get("pwd");
   if (oldPwd && !auth) {
@@ -3210,7 +3021,7 @@ function buildRuleProviders(ctx) {
   return geoAssets.reduce((providers, asset) => {
     addRuleProvider(providers, asset);
     return providers;
-  }, {});
+  }, {}));
 }
 function addRuleProvider(ruleProviders, ruleProvider) {
   const { geosite, geoip, geositeURL, geoipURL, format } = ruleProvider;
@@ -3578,7 +3389,7 @@ async function getClNormalConfig(ctx) {
           outbounds.push(outbound);
           if (isChain) {
             const chainTag = generateRemark(ctx, protocolIndex, port, addr, protocol, false, true);
-            const chain = safeCloneProxy(chainProxy);
+            let chain = structuredClone(chainProxy);
             chain["name"] = chainTag;
             chain["dialer-proxy"] = tag2;
             outbounds.push(chain);
@@ -4277,7 +4088,7 @@ async function getSbCustomConfig(ctx, isFragment) {
         selectorTags.push(tag2);
         if (isChain) {
           const chainTag = generateRemark(ctx, protocolIndex, port, addr, protocol, isFragment, true);
-          const chain = safeCloneProxy(chainProxy);
+          let chain = structuredClone(chainProxy);
           chain["tag"] = chainTag;
           chain["detour"] = tag2;
           outbounds.push(chain);
@@ -4593,7 +4404,7 @@ function buildFreedomOutbound(ctx, isFragment, isUdpNoises, tag2, length, interv
     freedomSettings = {
       fragment: {
         packets: packets || fragmentPackets,
-        length: sanitizeRangeString(length || toRange(fragmentLengthMin, fragmentLengthMax), toRange(MIN_FRAGMENT_LENGTH, MIN_FRAGMENT_LENGTH), MIN_FRAGMENT_LENGTH, MAX_FRAGMENT_LENGTH),
+        length: length || toRange(fragmentLengthMin, fragmentLengthMax),
         interval: interval || toRange(fragmentIntervalMin, fragmentIntervalMax),
         maxSplit: toRange(fragmentMaxSplitMin, fragmentMaxSplitMax)
       }
@@ -5379,8 +5190,8 @@ async function handleTCPOutBound(ctx, remoteSocketWapper, addressRemote, portRem
       const CONNECTION_TIMEOUT = 10000;
       
       tcpSocket = cfConnect({
-        hostname: targetAddress,
-        port: targetPort
+        hostname: currentAddress,
+        port: currentPort
       });
       remoteSocketWapper.value = tcpSocket;
       
@@ -5397,8 +5208,7 @@ async function handleTCPOutBound(ctx, remoteSocketWapper, addressRemote, portRem
 
     } catch (error) {
       recordEndpointFailure(targetAddress, targetPort);
-      const message2 = error instanceof Error ? error.message : String(error);
-      log(`Connection attempt ${i + 1} failed: ${message2}`);
+      log(`Connection attempt ${i + 1} failed: ${error.message}`);
       if (tcpSocket) safeCloseTcpSocket(tcpSocket);
       remoteSocketWapper.value = null;
 
@@ -5441,8 +5251,7 @@ async function handleTCPOutBound(ctx, remoteSocketWapper, addressRemote, portRem
     } catch (error) {
       remoteSocketWapper.connecting = false;
       recordEndpointFailure(targetAddress, targetPort);
-      const message2 = error instanceof Error ? error.message : String(error);
-      log(`Data transmission phase failed: ${message2}`);
+      log(`Data transmission phase failed: ${error.message}`);
       // Critical: Once we send rawClientData, we NEVER retry from the beginning 
       // because the server may have already received and acted on the request.
       safeCloseTcpSocket(tcpSocket);
@@ -5453,11 +5262,7 @@ async function handleTCPOutBound(ctx, remoteSocketWapper, addressRemote, portRem
 }
 
 async function waitForWebSocketDrain(webSocket, maxBuffer = 1024 * 1024, resumeBuffer = 512 * 1024, timeoutMs = 5000) {
-  if (typeof webSocket.bufferedAmount !== "number") {
-    await Promise.resolve();
-    return;
-  }
-  if (webSocket.bufferedAmount <= maxBuffer) return;
+  if (typeof webSocket.bufferedAmount !== "number" || webSocket.bufferedAmount <= maxBuffer) return;
   const start = Date.now();
   let delay = 10;
   while (webSocket.bufferedAmount > resumeBuffer) {
@@ -5699,7 +5504,8 @@ function base64ToArrayBuffer(base64Str) {
     if (pad) {
       base64Str += "=".repeat(4 - pad);
     }
-    const arryBuffer = base64ToUint8Array(base64Str);
+    const decode2 = atob(base64Str);
+    const arryBuffer = Uint8Array.from(decode2, (c) => c.charCodeAt(0));
     return { earlyData: arryBuffer.buffer, error: null };
   } catch (error) {
     return { earlyData: null, error };
@@ -5776,7 +5582,6 @@ async function VlOverWSHandler(ctx) {
     safeCloseTcpSocket(remoteSocketWapper.value);
     safeCloseWebSocket(webSocket);
     releaseConnection();
-  }, 1800000);
   });
   const overallTimeoutId = createOverallConnectionTimeout(log, () => {
     watchdog.stop();
@@ -5786,7 +5591,6 @@ async function VlOverWSHandler(ctx) {
   });
   let udpStreamWrite = null;
   let isDns = false;
-  let queuedOutboundBytes = 0;
   const writableStream = new WritableStream({
     async write(chunk) {
       watchdog.touch();
@@ -5794,17 +5598,7 @@ async function VlOverWSHandler(ctx) {
         return udpStreamWrite(chunk);
       }
       if (remoteSocketWapper.value || remoteSocketWapper.connecting) {
-        const chunkSize = chunk?.byteLength ?? chunk?.length ?? 0;
-        while (queuedOutboundBytes + chunkSize > MAX_OUTBOUND_WRITE_QUEUE_BYTES) {
-          await new Promise((resolve) => setTimeout(resolve, BACKPRESSURE_WAIT_MS));
-          watchdog.touch();
-        }
-        queuedOutboundBytes += chunkSize;
-        try {
-          await safeWriteToOutbound(remoteSocketWapper, chunk);
-        } finally {
-          queuedOutboundBytes = Math.max(0, queuedOutboundBytes - chunkSize);
-        }
+        await safeWriteToOutbound(remoteSocketWapper, chunk);
         watchdog.touch();
         return;
       }
@@ -5881,7 +5675,7 @@ async function VlOverWSHandler(ctx) {
   });
 }
 function parseVlHeader(VLBuffer, userID) {
-  if (!VLBuffer || VLBuffer.byteLength < 24) {
+  if (VLBuffer.byteLength < 24) {
     return {
       hasError: true,
       message: "invalid data"
@@ -5897,18 +5691,8 @@ function parseVlHeader(VLBuffer, userID) {
       message: "invalid user"
     };
   }
-
-  const data = new Uint8Array(VLBuffer);
-  const optLength = data[17] || 0;
-  const commandIndex = 18 + optLength;
-  if (commandIndex + 1 > data.length) {
-    return {
-      hasError: true,
-      message: "invalid header length"
-    };
-  }
-
-  const command = data[commandIndex];
+  const optLength = new Uint8Array(VLBuffer.slice(17, 18))[0];
+  const command = new Uint8Array(VLBuffer.slice(18 + optLength, 18 + optLength + 1))[0];
   let isUDP = false;
   if (command === 1) {
   } else if (command === 2) {
@@ -5919,67 +5703,27 @@ function parseVlHeader(VLBuffer, userID) {
       message: `command ${command} is not support, command 01-tcp,02-udp,03-mux`
     };
   }
-
-  const portIndex = commandIndex + 1;
-  if (portIndex + 2 > data.length) {
-    return {
-      hasError: true,
-      message: "invalid port field"
-    };
-  }
-
-  const portRemote = new DataView(data.buffer, data.byteOffset + portIndex, 2).getUint16(0);
-  const addressIndex = portIndex + 2;
-  if (addressIndex + 1 > data.length) {
-    return {
-      hasError: true,
-      message: "invalid address field"
-    };
-  }
-
-  const addressType = data[addressIndex];
+  const portIndex = 18 + optLength + 1;
+  const portBuffer = VLBuffer.slice(portIndex, portIndex + 2);
+  const portRemote = new DataView(portBuffer).getUint16(0);
+  let addressIndex = portIndex + 2;
+  const addressBuffer = new Uint8Array(VLBuffer.slice(addressIndex, addressIndex + 1));
+  const addressType = addressBuffer[0];
   let addressLength = 0;
   let addressValueIndex = addressIndex + 1;
   let addressValue = "";
-
   switch (addressType) {
-    case 1: {
+    case 1:
       addressLength = 4;
-      if (addressValueIndex + addressLength > data.length) {
-        return {
-          hasError: true,
-          message: "invalid IPv4 address length"
-        };
-      }
       addressValue = new Uint8Array(VLBuffer.slice(addressValueIndex, addressValueIndex + addressLength)).join(".");
       break;
-    }
-    case 2: {
-      if (addressValueIndex + 1 > data.length) {
-        return {
-          hasError: true,
-          message: "invalid domain length field"
-        };
-      }
-      addressLength = data[addressValueIndex];
+    case 2:
+      addressLength = new Uint8Array(VLBuffer.slice(addressValueIndex, addressValueIndex + 1))[0];
       addressValueIndex += 1;
-      if (addressLength <= 0 || addressValueIndex + addressLength > data.length) {
-        return {
-          hasError: true,
-          message: "invalid domain length"
-        };
-      }
       addressValue = new TextDecoder().decode(VLBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
       break;
-    }
     case 3: {
       addressLength = 16;
-      if (addressValueIndex + addressLength > data.length) {
-        return {
-          hasError: true,
-          message: "invalid IPv6 address length"
-        };
-      }
       const dataView = new DataView(VLBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
       const ipv6 = [];
       for (let i = 0; i < 8; i++) {
@@ -5994,15 +5738,6 @@ function parseVlHeader(VLBuffer, userID) {
         message: `invild  addressType is ${addressType}`
       };
   }
-
-  const rawDataIndex = addressValueIndex + addressLength;
-  if (rawDataIndex > data.length) {
-    return {
-      hasError: true,
-      message: "invalid data index"
-    };
-  }
-
   if (!addressValue) {
     return {
       hasError: true,
@@ -6014,7 +5749,7 @@ function parseVlHeader(VLBuffer, userID) {
     addressRemote: addressValue,
     addressType,
     portRemote,
-    rawDataIndex,
+    rawDataIndex: addressValueIndex + addressLength,
     VLVersion: version,
     isUDP
   };
@@ -6136,7 +5871,6 @@ async function TrOverWSHandler(ctx) {
     safeCloseTcpSocket(remoteSocketWapper.value);
     safeCloseWebSocket(webSocket);
     releaseConnection();
-  }, 1800000);
   });
   const overallTimeoutId = createOverallConnectionTimeout(log, () => {
     watchdog.stop();
@@ -6145,7 +5879,6 @@ async function TrOverWSHandler(ctx) {
     releaseConnection();
   });
   let udpStreamWrite = null;
-  let queuedOutboundBytes = 0;
   const writableStream = new WritableStream({
     async write(chunk, _controller) {
       watchdog.touch();
@@ -6153,17 +5886,7 @@ async function TrOverWSHandler(ctx) {
         return udpStreamWrite(chunk);
       }
       if (remoteSocketWapper.value || remoteSocketWapper.connecting) {
-        const chunkSize = chunk?.byteLength ?? chunk?.length ?? 0;
-        while (queuedOutboundBytes + chunkSize > MAX_OUTBOUND_WRITE_QUEUE_BYTES) {
-          await new Promise((resolve) => setTimeout(resolve, BACKPRESSURE_WAIT_MS));
-          watchdog.touch();
-        }
-        queuedOutboundBytes += chunkSize;
-        try {
-          await safeWriteToOutbound(remoteSocketWapper, chunk);
-        } finally {
-          queuedOutboundBytes = Math.max(0, queuedOutboundBytes - chunkSize);
-        }
+        await safeWriteToOutbound(remoteSocketWapper, chunk);
         watchdog.touch();
         return;
       }
@@ -6224,19 +5947,13 @@ async function TrOverWSHandler(ctx) {
   });
 }
 async function parseTrHeader(ctx, buffer) {
-  if (!buffer || buffer.byteLength < 56) {
+  if (buffer.byteLength < 56) {
     return {
       hasError: true,
       message: "invalid data"
     };
   }
   let crLfIndex = 56;
-  if (buffer.byteLength < crLfIndex + 2) {
-    return {
-      hasError: true,
-      message: "invalid header length"
-    };
-  }
   const cr = new Uint8Array(buffer.slice(crLfIndex, crLfIndex + 1))[0];
   const lf = new Uint8Array(buffer.slice(crLfIndex + 1, crLfIndex + 2))[0];
   if (cr !== 13 || lf !== 10) {
@@ -6275,39 +5992,15 @@ async function parseTrHeader(ctx, buffer) {
   switch (atype) {
     case 1:
       addressLength = 4;
-      if (addressIndex + addressLength > socks5DataBuffer.byteLength) {
-        return {
-          hasError: true,
-          message: "invalid IPv4 address length"
-        };
-      }
       address = new Uint8Array(socks5DataBuffer.slice(addressIndex, addressIndex + addressLength)).join(".");
       break;
     case 3:
-      if (addressIndex + 1 > socks5DataBuffer.byteLength) {
-        return {
-          hasError: true,
-          message: "invalid domain length field"
-        };
-      }
       addressLength = new Uint8Array(socks5DataBuffer.slice(addressIndex, addressIndex + 1))[0];
       addressIndex += 1;
-      if (addressLength <= 0 || addressIndex + addressLength > socks5DataBuffer.byteLength) {
-        return {
-          hasError: true,
-          message: "invalid domain length"
-        };
-      }
       address = new TextDecoder().decode(socks5DataBuffer.slice(addressIndex, addressIndex + addressLength));
       break;
     case 4: {
       addressLength = 16;
-      if (addressIndex + addressLength > socks5DataBuffer.byteLength) {
-        return {
-          hasError: true,
-          message: "invalid IPv6 address length"
-        };
-      }
       const dataView = new DataView(socks5DataBuffer.slice(addressIndex, addressIndex + addressLength));
       const ipv6 = [];
       for (let i = 0; i < 8; i++) {
@@ -6329,26 +6022,13 @@ async function parseTrHeader(ctx, buffer) {
     };
   }
   const portIndex = addressIndex + addressLength;
-  if (portIndex + 2 > socks5DataBuffer.byteLength) {
-    return {
-      hasError: true,
-      message: "invalid port field"
-    };
-  }
   const portBuffer = socks5DataBuffer.slice(portIndex, portIndex + 2);
   const portRemote = new DataView(portBuffer).getUint16(0);
-  const payloadIndex = portIndex + 4;
-  if (payloadIndex > socks5DataBuffer.byteLength) {
-    return {
-      hasError: true,
-      message: "invalid payload index"
-    };
-  }
   return {
     hasError: false,
     addressRemote: address,
     portRemote,
-    rawClientData: socks5DataBuffer.slice(payloadIndex)
+    rawClientData: socks5DataBuffer.slice(portIndex + 4)
   };
 }
 function sha224(string) {
@@ -6784,7 +6464,7 @@ async function getWarpConfigs(ctx) {
 }
 async function serveIcon() {
   const faviconBase64 = "AAABAAEAQEAAAAEAIAAoQgAAFgAAACgAAABAAAAAgAAAAAEAIAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAABMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcASGtEBSs/KFsRGRCyAwQC5wAAAPoBAgHtDxYOvyU2InFEZD8QTHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcAOVQ1LgcLB9UAAAD/AQEA/ykjGP9ANyb/MCod/wUEA/8AAAD/AgQC6yo/J1dMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcAOVU2KwIDAu4AAAD/Wk01/9W3f//105L/9dOS//XTkv/jxIf/emlI/wYFA/8AAAD/JjgjZkxwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAEptRQE2UDM3IjMgehQdEqsNFAzHBwsHzw4VDcUWIRWmJTcjcTpVNilMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcASGpDBgcKBtcAAAD/lYBY//XTkv/105L/9dOS//XTkv/105L/9dOS//TSkf+xjE7/DQoF/wABAPg6VTYsTHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcAS25GAC1DKlQHCwfXAAAA/wAAAP8AAAD/AAAA/wAAAP8AAAD/AAAA/wAAAP8AAAD/DBILwzVPMjhMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHACo/J1sAAAD/VUkz//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/xzIj/5LJh/5t5Qv8AAAD/EhoRrUxwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcAPls5IA4VDbwAAAD/BAMC/0k+K/+VgFn/y695/+rKi//00pH/6MiK/8aqdv+JdlH/Ny8h/wAAAP8AAAD9FyIVmkVlQA1McEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwARGRC0AAAA/8Gmc//105L/9dOS//XTkv/105L/9dOS//XTkv/105L/6r90/+SyYf/jsWD/MiYV/wAAAPlCYj4STHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcANlAyNQIEAuoAAAD/S0As/9O2fv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv+/pHH/Lykc/wAAAP8JDQjSQF88GUxwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBIakMFAAEA9R4aEv/00pH/9dOS//XTkv/105L/9dOS//XTkv/105L/8s2K/+SyYf/ksmH/5LJh/3pfM/8AAAD/LkQrUExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcAO1g3JQIDAu0CAQH/iXZR//TSkf/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS/+7Njv9bTjb/AAAA/wkNCM9GZ0EKTHBHAExwRwBMcEcATHBHAExwRwBMcEcAOFQ0LwAAAP9bTjb/9dOS//XTkv/105L/9dOS//XTkv/105L/9NKR/+i6bv/ksmH/5LJh/+SyYf+XdkD/AAAA/yo+J21McEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcARWZBDAcLBtgAAAD/lH9Y//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9NKR/15PM/8AAAD/ExwRp0tuRgBMcEcATHBHAExwRwBMcEcATHBHAC1EKlYAAAD/iXZR//XTkv/105L/9dOS//XTkv/105L/9dOS/+3Ffv/ksmH/5LJh/+SyYf/ksmH/kXE9/wAAAP8qPidmTHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHABspGYwAAAD/ZVc8//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/lunH/MSYU/wAAAP8sQSlUTHBHAExwRwBMcEcATHBHAExwRwAjNCB3AAAA/66WZ//105L/9dOS//XTkv/105L/9dOS//DKhf/ksmL/5LJh/+SyYf/ksmH/5LJh/2ROKv8AAAD/NE4xPExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAEJhPRMAAQD2ExAL/+fHiv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/6bxw/7WNTP8AAAD/CAwH0ktuRgBMcEcATHBHAExwRwBMcEcAHSobjwAAAP/JrXf/9dOS//XTkv/105L/9dOS//HMiP/ks2P/5LJh/+SyYf/ksmH/5LJh/92tXv8WEQn/AgMC60lrRARMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwAlNyNuAAAA/4RyTv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS/+e4av/ksmH/QzQc/wAAAP82UDI2THBHAExwRwBMcEcATHBHABYhFaEAAAD/3b6D//XTkv/105L/9dOS//LNif/ltWX/5LJh/+SyYf/ksmH/5LJh/+OxYP9iTCn/AAAA/x4tHIRMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcADhYOuwQDAv/kxIf/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//TRkP/ksmL/5LJh/6J+RP8AAAD/HiwchkxwRwBMcEcATHBHAExwRwASGxGxAAAA/+7Njv/105L/9dOS//DLhv/ltGX/5LJh/+SyYf/ksmH/5LJh/9WmWv9bRyb/AAAA/wgMB9dFZkELTHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAAIDAucqJBn/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/wyoX/5LJh/+SyYf/drF3/BQMC/w4WDr5McEcATHBHAExwRwBMcEcADxYOvgYGA//105L/9dOS/+/Igv/ksmL/5LJh/+SyYf/gr1//rohK/19KKP8LCQT/AAAA/wUIBd88WTgkTHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAEptRQAAAAD8QTgm//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/6r91/+SyYf/ksmH/5LJh/yMcD/8EBgTiTHBHAExwRwBMcEcATHBHAAsQCsoPDQn/zK95/7CUYf+Pbz3/dFsx/1ZDJP8xJhT/CAcD/wAAAP8AAAD/AgMC7B4sHIRFZUANTHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBJbEQAAAAA/EM5J//105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9NKQ/+W0ZP/ksmH/5LJh/+SyYf81KRb/AAAA8kxwRwBMcEcATHBHAExwRwAHCwfYAAAA/wAAAP8AAAD/AAAA/wAAAP8AAAD/AAEA8wsRC8ccKhqQMUguSUdpQwZMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAAABAO0yKx7/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS/+/Igv/ksmH/5LJh/+SyYf/ksmH/MicV/wAAAO9McEcATHBHAExwRwBMcEcAHiwcghAXDroZJReeIDAegik8JmQzTDBEPlw6IElsRAFMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwAJDgnRFRIM//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/ou27/5LJh/+SyYf/ksmH/5LJh/xoUCv8HCwfYTHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcAFB4TpwAAAP/cvYL/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/yzYr/5LJh/+SyYf/ksmH/5LJh/8yfVv8AAAD/FB0Sq0xwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHACQ1IXUAAAD/o4xh//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/6r50/+SyYf/ksmH/5LJh/+SyYf+AZDb/AAAA/yY5I2tMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwA0TjE7AAAA/2FUOv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/8s6L/+SyYv/ksmH/5LJh/+SyYf/ZqVz/GRMK/wABAPhBXzwYTHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcASGpDBQECAfAXEw3/8tGQ//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS/+m8cP/ksmH/5LJh/+SyYf/ksmH/XEcn/wAAAP8aJxmOTHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHADhTNC4fLh2FDhUNwAUIBeAAAADpBwsH2RIbEbMlNiJ0P147G0xwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwASHBGuAAAA/8Clcv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//DLhv/ksmH/5LJh/+SyYf/ksmH/kXE9/wAAAP8FCAXeRWVADUxwRwBMcEcATHBHAExwRwBMcEcARWVADhQdEqUAAAD/AAAA/wAAAP8PDQn/GhYP/wgHBf8AAAD/AAAA/wAAAPkaJhiQRWVADExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcAKT0mYAAAAP9yYkT/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//TSkf/nuWz/5LJh/+SyYf/ksmH/mXhB/wYEAv8CAwLtOVU2LExwRwBMcEcATHBHAExwRwBMcEcAO1g3JggMB9cAAAD/KCIX/5aBWf/dvoT/9dOS//XTkv/z0ZD/zbF6/4NxTv8bFxD/AAAA/wcLB9k6VTYsTHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAEJiPRAAAQD3HhoR//PRkf/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/ux4D/5LJh/+SyYf/jsWD/el8z/wEBAP8CAwLwNlAyOExwRwBMcEcATHBHAExwRwBMcEcANlAyNQIDAu4BAAD/eWhI//HQkP/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/68qM/3JiQ/8CAQH/AgMC8TdRMzZMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcAExwRqQAAAP+7oW//9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/00Y//5bVm/+SyYf/gr1//XUgn/wAAAP8CBALuNE4xOExwRwBMcEcATHBHAExwRwBMcEcAP106HQMEA+kAAAD/i3dS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/k35X/wAAAP8EBwThRWVADExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHADFJLkQAAAD/Y1U6//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/6r91/+SyYf/AllH/MCUU/wAAAP8JDQjRPFk4JUxwRwBMcEcATHBHAExwRwBMcEcARmhCCQsQCsoAAAD/gnBN//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv9tXkH/AAAA/x4sHIhMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBKbUUABwsH2Q0LB//oyIr/9dOS//XTkv/105L/9dOS//XTkv/105L/8MmE/+KxYP+DZjf/CQcD/wAAAP8VHxOgRmhBCkxwRwBMcEcATHBHAExwRwBMcEcAS25GABMdEqgAAAD/aFk+//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/786O/yIeFP8BAgH0QmI+EUxwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHACIyH3kAAAD/jnpU//XTkv/105L/9dOS//XTkv/105L/9NGQ/8adWv82Khb/AAAA/wIDAvApPSdZTHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHACg7JWIAAAD/Licb/+/Ojv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv+GdFD/AAAA/yc6JWZMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwA/XTsbAAAA+iYgFv/z0ZH/9dOS//XTkv/105L/8M6O/4JtSP8JBwT/AAAA/w8WDrs9WjkgTHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAD9dOxoCAwLuCAcE/8queP/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/zrF6/wAAAP8THRKqTHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHABMcEqwAAAD/sJhp//XTkv/105L/qpJl/yMeFf8AAAD/BQcE4yo/KFhLbkYATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAEtuRgARGRCyAAAA/5R/WP/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//PRkf8HBgT/CAwH1UxwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwAwRy1JAAAA/1JHMf/WuH//SD0q/wAAAP8AAAD/FiEVnUVlQA5McEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwArQChXAAAA/0I4J//00pH/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/FBEM/wECAeJMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcASGtDAwQHBOAGBQP/CgkG/wAAAP8LEArJNU4xOkxwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBCYj4UAwQC6QcGBP/Psnv/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9NKR/wgHBf8IDAfWTHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwAiMyBzAAAA/wUHBOMqPidcSm1FAkxwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcAFiEVngAAAP97akn/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS/9K0fP8AAAD/EhwRrkxwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcAR2lCBitAKV9FZUAOTHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcANU8xOAAAAP4hHBP/7cyN//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv+MeVP/AAAA/yY4I2tMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcASWxEAgoPCc0AAAD/qJBj//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/y0JD/KSMY/wABAPdAXzwVTHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAEZnQQ0AAQD0AAAA/wgHBP9lVjz/1bd+//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9dOS//XTkv/105L/9NKR//HMiP/tw3v/f2c+/wAAAP8YIxaZTHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcAPls6HR8tHIUDBAPoAAAA/wMDAv9IPiv/p49h/+zGgf/wyYT/8MqE//DJhP/wyYP/78iC/+7HgP/txX3/7MN6/+vAdf/pvHD/57hq/+SzYv/ksmH/on5E/wQDAf8CBALrQWA8GExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcASGpDBSxBKVUNFAzCAAAA/wAAAP8VEQn/ZE4q/7KLS//jsWD/5LJh/+SyYf/ksmH/5LJh/+SyYf/ksmH/5LJh/+SyYf/hsF//gGQ2/wYEAv8AAQD4MUkuQ0xwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHADlUNSwZJReXAAEA9AAAAP8AAAD/HBYM/2NNKv+hfkT/1qdb/+SyYf/ksmH/5LJh/+GvX/+jf0X/LyQT/wAAAP8CAwLwMUguQ0xwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAERkPw8qPyheEhsRsAABAPUAAAD/AAAA/wAAAP8WEQn/KB8R/yYeEP8KCAT/AAAA/wAAAP8PFw61PFk4JUxwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBFZkEKMkovRCExH38THBGwCQ0I0gMFA+QFBwTiCxELyB0rG484UjQwTHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcATHBHAExwRwBMcEcA////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////gD////////8AH////////gAP///+AH/8AAf///wAH/wAB///8AAH/AAD///gAAP4AAP//8AAAfgAA///gAAB+AAD//+AAAD4AAP//wAAAPgAA///AAAAeAAH//8AAAB4AAf//wAAAHgAD///AAAAeAAf//8AAAB4AH///wAAAHgH////AAAAf/////8AAAB//////wAAAH//////AAAAf/////8AAAD+AP///4AAAPgAP///gAAB8AAf//+AAAPgAA///8AAB8AAB///wAAPgAAH///gAB+AAAP//+AAfwAAA///4AD+AAAD///wA/4AAAP///AH/AAAA///8B/4AAAD///4P/gAAAP///j/8AAAA//////gAAAD/////+AAAAf/////8AAAB//////8AAAP//////+AAB///////+AAP////////AD///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////8=";
-  const body = base64ToUint8Array(faviconBase64);
+  const body = Uint8Array.from(atob(faviconBase64), (c) => c.charCodeAt(0));
   return new Response(body, {
     headers: {
       "Content-Type": "image/x-icon",
@@ -6847,7 +6527,7 @@ async function updateWarpConfigs(request, env) {
   return respond(false, 405 /* METHOD_NOT_ALLOWED */, "Method not allowed.");
 }
 async function decompressHtml(content, asString) {
-  const bytes = base64ToUint8Array(content);
+  const bytes = Uint8Array.from(atob(content), (c) => c.charCodeAt(0));
   const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
   if (asString) {
     const decompressedArrayBuffer = await new Response(stream).arrayBuffer();
@@ -6880,7 +6560,7 @@ async function handleDoH(ctx) {
   try {
     const requestInit = {
       method: request.method,
-      headers: buildDoHForwardHeaders(request),
+      headers: request.headers,
       signal: controller.signal
     };
     if (request.method !== "GET" && request.method !== "HEAD") {
@@ -6918,7 +6598,7 @@ var worker_default = {
   async fetch(request, env, context) {
     const runWithTimeout = async () => {
       return await Promise.race([
-        this.handleFetch(request, env, context, () => {}),
+        this.handleFetch(request, env, context),
         new Promise((_, reject) => setTimeout(() => reject(new Error("Request Timeout after 45s")), 45000))
       ]);
     };
@@ -6929,9 +6609,8 @@ var worker_default = {
     const { pathname } = new URL(request.url);
     const upgradeHeader = request.headers.get("Upgrade");
     const isWebSocket = upgradeHeader?.toLowerCase() === "websocket";
-    const releaseConnection = isWebSocket ? acquireConnectionSlot(clientIP) : () => {};
 
-    if (isWebSocket && !releaseConnection) {
+    if (isWebSocket && !checkConnectionLimit(clientIP)) {
       return new Response("Too many active connections", {
         status: 429,
         headers: {
@@ -6944,33 +6623,26 @@ var worker_default = {
     // Do not apply local rate limiting to tunnel traffic paths.
     const isControlPath = pathname.startsWith("/login") || pathname.startsWith("/panel") || pathname.startsWith("/secrets") || pathname.startsWith("/reset-password") || pathname.startsWith("/update");
 
-    const maxRequestsPerMinute = getMaxRequestsPerMinute(env);
-
-    if (!isWebSocket && isControlPath && !checkRateLimit(clientIP, maxRequestsPerMinute)) {
+    if (!isWebSocket && isControlPath && !checkRateLimit(clientIP)) {
       return new Response("Rate limit exceeded. Please try again later.", {
         status: 429,
         headers: {
           "Content-Type": "text/plain;charset=utf-8",
           "Retry-After": "60",
-          "X-Rate-Limit-Limit": maxRequestsPerMinute.toString()
+          "X-Rate-Limit-Limit": MAX_REQUESTS_PER_MINUTE.toString()
         }
       });
     }
 
-    const runner = isWebSocket ? this.handleFetch(request, env, context, releaseConnection) : runWithTimeout();
-    const response = await runner.catch(async (error) => {
-      releaseConnection();
+    const runner = isWebSocket ? this.handleFetch(request, env, context) : runWithTimeout();
+    return await runner.catch(async (error) => {
       const message2 = error instanceof Error ? error.message : String(error);
       console.error("[TIMEOUT/ERROR]", message2);
       return await renderError(error);
     });
-    if (isWebSocket && response?.status !== 101) {
-      releaseConnection();
-    }
-    return response;
   },
 
-  async handleFetch(request, env, context, releaseConnection = () => {}) {
+  async handleFetch(request, env, context) {
     try {
       const upgradeHeader = request.headers.get("Upgrade");
       const { pathname, origin, searchParams, hostname } = new URL(request.url);
@@ -7011,7 +6683,7 @@ var worker_default = {
           subPath: SUB_PATH || UUID
         },
         settings: DEFAULT_SETTINGS,
-        releaseConnection
+        releaseConnection: () => {}
       };
 
       // 2. Isolated Bridge: Sync to globalThis for legacy function support
@@ -7048,6 +6720,7 @@ var worker_default = {
 
       // 4. Routing
       if (upgradeHeader?.toLowerCase() === "websocket") {
+        ctx.releaseConnection = beginConnectionTracking(request.headers.get("CF-Connecting-IP") || request.headers.get("X-Forwarded-For") || "unknown");
         return await handleWebsocket(ctx);
       } else {
         const path = ctx.globalConfig.pathName.split("/")[1];
@@ -7100,7 +6773,7 @@ var worker_default = {
                 stale: SETTINGS_CACHE.data && (now - SETTINGS_CACHE.timestamp) > SETTINGS_CACHE.ttl,
                 version: SETTINGS_CACHE.version
               },
-              activeConnections: getActiveConnectionStats(),
+              activeConnections: ACTIVE_CONNECTIONS.size,
               warp: {
                 cached: !!WARP_CACHE.data,
                 age: WARP_CACHE.data ? Math.floor((now - WARP_CACHE.timestamp) / 1000) + 's' : null,
@@ -7122,7 +6795,6 @@ var worker_default = {
         }
       }
     } catch (error) {
-      releaseConnection();
       return await renderError(error);
     }
   }
