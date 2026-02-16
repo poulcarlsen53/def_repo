@@ -1,3 +1,4 @@
+const cfConnect = typeof connect === "function" ? connect : (typeof globalThis !== "undefined" && typeof globalThis.connect === "function" ? globalThis.connect : null);
 import { connect as cfConnect } from "cloudflare:sockets";
 
 // Debug mode flag
